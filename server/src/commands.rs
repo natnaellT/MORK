@@ -9,7 +9,7 @@ use std::usize;
 
 use mork::{OwnedExpr, ExprTrait};
 use mork::{Space, space::serialize_sexpr_into};
-use pathmap::zipper::{ZipperIteration, ZipperMoving, ZipperWriting, ZipperReadOnlyConditionalIteration, ZipperReadOnlyConditionalValues, ZipperAbsolutePath};
+use pathmap::zipper::{ZipperIteration, ZipperMoving, ZipperWriting, ZipperAbsolutePath};
 use tokio::fs::File;
 use tokio::io::{BufWriter, AsyncWriteExt};
 
@@ -161,6 +161,7 @@ impl CommandDefinition for ClearCmd {
         let mut wz = ctx.0.space.write_zipper(&mut writer);
         wz.remove_branches(true);
         wz.remove_val(true);
+        ctx.0.space.cleanup_write_zipper(wz);
         Ok("ACK. Cleared".into())
     }
 }
@@ -205,6 +206,7 @@ impl CommandDefinition for CopyCmd {
         let rz = ctx.0.space.read_zipper(&mut reader);
         let mut wz = ctx.0.space.write_zipper(&mut writer);
         wz.graft(&rz);
+        ctx.0.space.cleanup_write_zipper(wz);
         Ok("ACK. Copied".into())
     }
 }
@@ -335,7 +337,7 @@ fn do_bfs(ctx: &MorkService, cmd: Command, mut reader: ReadPermission, mut expr:
 
     let mut first = true;
     writer.write(b"[")?;
-    for (new_tok, expr) in result_paths {
+    for (new_tok, expr, downstream_cnt) in result_paths {
         if first {
             first = false
         } else {
@@ -351,10 +353,14 @@ fn do_bfs(ctx: &MorkService, cmd: Command, mut reader: ReadPermission, mut expr:
             } else {
                 writer.write(b", ")?;
             }
-            writer.write(format!("{}", byte as u16).as_bytes())?;
+            write!(writer, "{}", byte as u16)?;
         }
 
-        writer.write(b"], \"expr\": ")?;
+        writer.write(b"], \"cnt\": ")?;
+
+        write!(writer, "{downstream_cnt}")?;
+
+        writer.write(b", \"expr\": ")?;
 
         serialize_sexpr_into(expr.borrow().ptr, &mut expr_buffer, ctx.0.space.symbol_table())
             .map_err(|e|CommandError::internal(format!("failed to serialize to MeTTa S-Expressions: {e:?}")))?;
@@ -509,27 +515,23 @@ fn dump_as_format<W: Write>(ctx: &MorkService, writer: &mut std::io::BufWriter<W
         // #[cfg(not(feature="interning"))]
         DataFormat::Paths => {
             // println!("serializing...");
-            thread_local!{
-                static buf: std::cell::UnsafeCell<[u8; 4096]> = std::cell::UnsafeCell::new([0; 4096]);
-            }
-            buf.with(|b| {
-                let mut rz = ctx.0.space.read_zipper(&mut reader);
-                pathmap::paths_serialization::serialize_paths_from_funcs(writer, &mut rz, |rz| Ok(rz.to_next_val()), |rz| {
-                    let p = rz.origin_path();
-                    let mut oz = ExprZipper::new(Expr{ ptr: unsafe { (*b.get()).as_mut_ptr() } });
-                    // println!("dump transforming {:?} with {:?} => {:?}", Expr{ ptr: p.as_ptr() as *mut u8 }, pattern.borrow(), template.borrow());
-                    match (Expr{ ptr: p.as_ptr() as *mut u8 }.transformData(pattern.borrow(), template.borrow(), &mut oz)) {
-                        Ok(()) => unsafe {
-                            // println!("success {:?}", Expr{ ptr: (*b.get()).as_mut_ptr() });
-                            Some(slice_from_raw_parts((*b.get()).as_ptr(), oz.loc).as_ref().unwrap())
-                        }
-                        Err(_e) => {
-                            // println!("failure");
-                            None
-                        }
+            let mut buf = std::mem::MaybeUninit::<[u8; 4096]>::uninit();
+            let buf_ptr = buf.as_mut_ptr().cast::<u8>();
+            let mut rz = ctx.0.space.read_zipper(&mut reader);
+            pathmap::paths_serialization::serialize_paths_from_funcs(writer, &mut rz, |rz| Ok(rz.to_next_val()), |rz| {
+                let p = rz.origin_path();
+                let mut oz = ExprZipper::new(Expr{ ptr: buf_ptr });
+                // println!("dump transforming {:?} with {:?} => {:?}", Expr{ ptr: p.as_ptr() as *mut u8 }, pattern.borrow(), template.borrow());
+                match (Expr{ ptr: p.as_ptr() as *mut u8 }.transformData(pattern.borrow(), template.borrow(), &mut oz)) {
+                    Ok(()) => unsafe {
+                        // println!("success {:?}", Expr{ ptr: buf_ptr });
+                        Some(slice_from_raw_parts(buf_ptr, oz.loc).as_ref().unwrap())
+                    }
+                    Err(_e) => {
+                        // println!("failure");
+                        None
                     }
                 }
-            )
             }).map_err(|e| CommandError::internal(format!("Error occurred writing raw paths: {e:?}")))?;
         }
     };
@@ -672,7 +674,7 @@ async fn do_import(ctx: &MorkService, thread: WorkThreadHandle, cmd: &Command, p
         let file_handle = std::fs::File::open(&file_path)?;
         let file_stream = BufReader::new(file_handle);
 
-        do_parse(&ctx_clone.0.space, file_stream, pattern, template, &mut writer, file_type)
+        do_parse(ctx_clone, file_stream, pattern, template, &mut writer, file_type)
     }).await.map_err(CommandError::internal)? {
         Ok(()) => {},
         Err(err) => {
@@ -725,7 +727,8 @@ fn detect_file_type(_file_path: &Path, uri: &str) -> Result<DataFormat, CommandE
     DataFormat::from_str(extension).ok_or_else(|| file_extension_err())
 }
 
-fn do_parse<SrcStream: Read + BufRead>(space: &ServerSpace, src: SrcStream, pattern: OwnedExpr, template: OwnedExpr, writer: &mut WritePermission, file_type: DataFormat) -> Result<(), CommandError> {
+fn do_parse<SrcStream: Read + BufRead>(ctx: MorkService, src: SrcStream, pattern: OwnedExpr, template: OwnedExpr, writer: &mut WritePermission, file_type: DataFormat) -> Result<(), CommandError> {
+    let space = &ctx.0.space;
     let pattern_expr = pattern.borrow();
     let template_expr = template.borrow();
     match file_type {
@@ -749,24 +752,30 @@ fn do_parse<SrcStream: Read + BufRead>(space: &ServerSpace, src: SrcStream, patt
         DataFormat::Paths => {
             let bl = writer.path().len();
             let mut wz = space.write_zipper(writer);
-            thread_local!{
-                static buf: std::cell::UnsafeCell<[u8; 4096]> = std::cell::UnsafeCell::new([0; 4096]);
-            }
-            let pathmap::paths_serialization::DeserializationStats { path_count, .. } = buf.with(|b| {
-                // println!("for each deserialized...");
-                pathmap::paths_serialization::for_each_deserialized_path(src, |k, p| {
-                    let mut oz = ExprZipper::new(Expr{ ptr: unsafe { (*b.get()).as_mut_ptr() } });
-                    // println!("transforming {:?} with {:?} => {:?}", Expr{ ptr: p.as_ptr() as *mut u8 }, pattern.borrow(), template.borrow());
-                    match (Expr{ ptr: p.as_ptr() as *mut u8 }.transformData(pattern.borrow(), template.borrow(), &mut oz)) {
-                        Ok(()) => unsafe {
-                            wz.move_to_path(slice_from_raw_parts((*b.get()).as_ptr().offset(bl as _), oz.loc).as_ref().unwrap());
-                            wz.set_val(());
-                        }
-                        Err(_e) => {}
+            let mut buf = std::mem::MaybeUninit::<[u8; 4096]>::uninit();
+
+            let buf_ptr = buf.as_mut_ptr().cast::<u8>();
+            // println!("for each deserialized...");
+            let result = pathmap::paths_serialization::for_each_deserialized_path(src, |_k, p| {
+                let mut oz = ExprZipper::new(Expr{ ptr: buf_ptr });
+                // println!("transforming {:?} with {:?} => {:?}", Expr{ ptr: p.as_ptr() as *mut u8 }, pattern.borrow(), template.borrow());
+                match (Expr{ ptr: p.as_ptr() as *mut u8 }.transformData(pattern.borrow(), template.borrow(), &mut oz)) {
+                    Ok(()) => unsafe {
+                        wz.move_to_path(slice_from_raw_parts(buf_ptr.offset(bl as _), oz.loc).as_ref().unwrap());
+                        wz.set_val(());
                     }
-                    std::io::Result::Ok(())
-                })
-            }).map_err(|e| CommandError::external(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+                    Err(_e) => {}
+                }
+                std::io::Result::Ok(())
+            });
+
+            ctx.0.space.cleanup_write_zipper(wz);
+
+            let path_count = match result {
+                Ok(pathmap::paths_serialization::DeserializationStats { path_count, .. }) => path_count,
+                Err(e) => return Err(CommandError::external(StatusCode::BAD_REQUEST, format!("{e:?}")))
+            };
+
             println!("Loaded {path_count} paths from `.paths` file");
         }
     }
@@ -1130,6 +1139,7 @@ impl CommandDefinition for MettaThreadSuspendCmd {
 
         suspend_wz.descend_to(exec_prefix_expr.as_bytes());
         suspend_wz.graft_map(pats_templates);
+        ctx.0.space.cleanup_write_zipper(suspend_wz);
 
         Ok(
             WorkResult::Immediate(
@@ -1509,7 +1519,7 @@ impl CommandDefinition for UploadCmd {
         let src_buf     = get_all_post_frame_bytes(&mut req).await?;
         let data_format = format;
         match tokio::task::spawn_blocking(move || {
-            do_parse(&ctx_clone.0.space, &src_buf[..], pattern, template, &mut writer, data_format)
+            do_parse(ctx_clone, &src_buf[..], pattern, template, &mut writer, data_format)
         }).await.map_err(CommandError::internal)? {
             Ok(()) => {},
             Err(err) => {
@@ -1652,6 +1662,7 @@ impl CommandError {
             StatusRecord::PathReadOnlyTemporary => Self::external(StatusCode::CONFLICT, log_message),
             StatusRecord::PathForbidden => Self::external(StatusCode::FORBIDDEN, log_message),
             StatusRecord::PathForbiddenTemporary => Self::external(StatusCode::CONFLICT, log_message),
+            StatusRecord::ServerShutdown => Self::external(StatusCode::SERVICE_UNAVAILABLE, "Server is shutting down"),
             StatusRecord::FetchError(err) => Self::external(err.status_code, err.log_message),
             StatusRecord::ParseError(err) => Self::external(StatusCode::UNSUPPORTED_MEDIA_TYPE, err.log_message),
             StatusRecord::ExecError(err) =>Self::external(StatusCode::BAD_REQUEST, err),
@@ -1742,18 +1753,37 @@ impl<'a> DerivedPrefix<'a> {
 
 // wrapper for [`mork_bytestring::Expr::prefix`] to make the interface more straight-forward
 fn derive_prefix_from_expr_slice(expr_slice : &[u8]) -> DerivedPrefix<'_>{
+    if expr_slice.is_empty() {
+        return DerivedPrefix::TillConst {
+            full: expr_slice,
+            till_last_constant: expr_slice,
+        };
+    }
+
+    if expr_slice == [mork_bytestring::Tag::Arity(0).byte()] {
+        return DerivedPrefix::TillConst {
+            full: expr_slice,
+            till_last_constant: expr_slice,
+        };
+    }
+
     unsafe {
-      match (mork_bytestring::Expr{
-          ptr : expr_slice.as_ptr() as *mut _
-      })
-      .prefix()
-      {
-        Ok(pre) => DerivedPrefix::TillVar(&*pre),
-        Err(till_last) => DerivedPrefix::TillConst {
-            full               : expr_slice, 
-            till_last_constant : &*till_last,
-        },
-      }
+        match std::panic::catch_unwind(|| {
+            (mork_bytestring::Expr{
+                ptr : expr_slice.as_ptr() as *mut _
+            })
+            .prefix()
+        }) {
+            Ok(Ok(pre)) => DerivedPrefix::TillVar(&*pre),
+            Ok(Err(till_last)) => DerivedPrefix::TillConst {
+                full               : expr_slice,
+                till_last_constant : &*till_last,
+            },
+            Err(_) => DerivedPrefix::TillConst {
+                full: expr_slice,
+                till_last_constant: &expr_slice[..0],
+            },
+        }
     }
 }
 
@@ -1770,6 +1800,19 @@ fn prefix_assertions() {
 
     prefix_to_var!(e1 : expr ; pe1 : prefix ; "a");
     core::assert_eq!{e1, pe1.till_constant_to_full()};
+
+    prefix_to_var!(e0 : expr ; pe0 : prefix ; "()");
+    core::assert_eq!{e0, pe0.till_constant_to_full()};
+    core::assert_eq!{e0, pe0.till_constant_to_till_last_constant()};
+
+    let invalid = [64u8];
+    let invalid_panics = std::panic::catch_unwind(|| {
+        (mork_bytestring::Expr { ptr: invalid.as_ptr() as *mut _ }).prefix()
+    });
+    core::assert!(invalid_panics.is_err());
+    let invalid_prefix = derive_prefix_from_expr_slice(&invalid);
+    core::assert_eq!(invalid_prefix.till_constant_to_full(), &invalid);
+    core::assert_eq!(invalid_prefix.till_constant_to_till_last_constant(), &invalid[..0]);
 
     prefix_to_var!(e2 : expr; pe2 : prefix; "$a");
     core::assert_ne!{e2, pe2.till_constant_to_full()};
@@ -1842,4 +1885,95 @@ async fn misbehaving_transform() -> Result<(), ()> {
     // this prints "c" !
     println!("{}", String::from_utf8(out).unwrap());
     Ok(())
+}
+
+#[cfg(test)]
+async fn load_and_explore_symbol_case(input: &str) -> String {
+    let ctx = MorkService::new().await;
+
+    let pattern = ctx.0.space.sexpr_to_expr("$").unwrap();
+    let template = ctx.0.space.sexpr_to_expr("_1").unwrap();
+    let expr_bytes = pattern.as_bytes().to_vec();
+
+    let mut writer = ctx.0.space.new_writer(&[], &()).unwrap();
+    ctx.0.space
+        .load_sexpr(input.as_bytes(), pattern.borrow(), template.borrow(), &mut writer)
+        .unwrap();
+    drop(writer);
+
+    let reader = ctx.0.space.new_reader_async(&[], &()).await.unwrap();
+    let cmd = Command {
+        def: ExploreCmd::CONST_CMD,
+        args: vec![ArgVal::Expr(pattern), ArgVal::Path(vec![])],
+        properties: vec![],
+        cmd_id: 0,
+    };
+
+    let out = do_bfs(&ctx, cmd, reader, expr_bytes).unwrap();
+    String::from_utf8(out.get_bytes().unwrap().to_vec()).unwrap()
+}
+
+#[cfg(test)]
+async fn explore_malformed_symbol_case() {
+    let ctx = MorkService::new().await;
+
+    let pattern = ctx.0.space.sexpr_to_expr("$").unwrap();
+    let expr_bytes = pattern.as_bytes().to_vec();
+
+    let mut writer = ctx.0.space.new_writer(&[], &()).unwrap();
+    let mut wz = ctx.0.space.write_zipper(&mut writer);
+    #[cfg(feature = "interning")]
+    {
+        let permit = ctx.0.space.symbol_table().try_aquire_permission().unwrap();
+        let symbol = permit.get_sym_or_insert(&[b' ', b'[', b']', b'(', b')', b'"']);
+        wz.descend_to(&symbol);
+    }
+    #[cfg(not(feature = "interning"))]
+    {
+        wz.descend_to(&[mork_bytestring::Tag::SymbolSize(1).byte(), 192u8]);
+    }
+    wz.set_val(());
+    ctx.0.space.cleanup_write_zipper(wz);
+    drop(writer);
+
+    let reader = ctx.0.space.new_reader_async(&[], &()).await.unwrap();
+    let cmd = Command {
+        def: ExploreCmd::CONST_CMD,
+        args: vec![ArgVal::Expr(pattern), ArgVal::Path(vec![])],
+        properties: vec![],
+        cmd_id: 0,
+    };
+
+    do_bfs(&ctx, cmd, reader, expr_bytes).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn symbol_edge_cases() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let long_symbol = "a".repeat(2049);
+        let cases = [
+            ("simple", "(edge simple)\n".to_string()),
+            ("spaces", "(edge \"contains spaces\")\n".to_string()),
+            ("leading/trailing whitespace", "(edge \" leading and trailing \")\n".to_string()),
+            ("parser-reserved chars", "(edge \"$ _1 [2] ()\")\n".to_string()),
+            ("brackets and parens", "(edge \"contains [brackets] and (parens)\")\n".to_string()),
+            ("unicode", "(edge \"café au lait\")\n".to_string()),
+            ("long symbol", format!("(edge {})\n", long_symbol)),
+        ];
+
+        for (name, input) in cases {
+            let output = load_and_explore_symbol_case(&input).await;
+            assert!(output.starts_with('['), "edge case `{name}` returned malformed JSON");
+            assert!(output.ends_with(']'), "edge case `{name}` returned malformed JSON");
+        }
+
+        explore_malformed_symbol_case().await;
+    });
 }

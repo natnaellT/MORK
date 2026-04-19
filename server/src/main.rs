@@ -144,6 +144,9 @@ impl MorkService {
 
         println!("Beginnging shutdown.  No new connections will be accepted"); //GOAT log this.
 
+        // Notify any open status_streams that the server is shutting down, and then close the connections
+        self.0.space.status_map.shutdown_status_streams();
+
         //Wait for all connections finish
         shutdown_watcher.shutdown().await;
         drop(listener);
@@ -699,6 +702,7 @@ mod worker_pool {
         }
 
         /// Returns the monotonically incrementing job counter for the worker pool
+        #[allow(unused)]
         pub fn job_counter(&self) -> u64 {
             self.job_counter.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -758,7 +762,7 @@ fn main() {
     runtime.thread_stack_size(16*1024*1024);
     runtime.enable_io();
     runtime.enable_time();
-    let mut runtime = runtime.build().unwrap();
+    let runtime = runtime.build().unwrap();
 
     //Init the Mork network service
     let service = runtime.block_on(MorkService::new());

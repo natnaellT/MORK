@@ -26,6 +26,7 @@ pub enum StatusRecord {
     PathReadOnlyTemporary,
     PathForbidden,
     PathForbiddenTemporary,
+    ServerShutdown,
     CountResult(CountResult),
     FetchError(FetchError),
     ParseError(ParseError),
@@ -84,6 +85,7 @@ impl StatusRecord {
             Self::PathReadOnlyTemporary => true,
             Self::PathForbidden => true,
             Self::PathForbiddenTemporary => true,
+            Self::ServerShutdown => false,
             Self::FetchError(_) => false,
             Self::ParseError(_) => false,
             Self::ExecError(_) => false,
@@ -98,6 +100,7 @@ impl StatusRecord {
             Self::PathReadOnlyTemporary => true,
             Self::PathForbidden => true,
             Self::PathForbiddenTemporary => true,
+            Self::ServerShutdown => false,
             Self::FetchError(_) => false,
             Self::ParseError(_) => false,
             Self::ExecError(_) => false,
@@ -193,9 +196,25 @@ impl StatusMap {
     /// Removes the stream from the `StatusMap`'s streams table
     pub fn remove_stream(&self, path: &[u8], stream_id: u64) {
         let mut guard = self.0.streams.write().unwrap();
-        let senders_vec = guard.get_val_mut_at(path).unwrap();
+        let Some(senders_vec) = guard.get_val_mut_at(path) else {
+            return;
+        };
         if let Some(pos) = senders_vec.iter().position(|(map_stream_id, _)| *map_stream_id == stream_id) {
             senders_vec.remove(pos);
+            if senders_vec.is_empty() {
+                guard.remove_val_at(path, true);
+            }
+        }
+    }
+
+    /// Sends a terminal shutdown event to all open status streams, then removes them from the map.
+    pub fn shutdown_status_streams(&self) {
+        let mut guard = self.0.streams.write().unwrap();
+        let streams = core::mem::replace(&mut *guard, PathMap::new());
+        for (_path, stream_vec) in streams {
+            for (_id, sender) in stream_vec {
+                let _ = sender.try_send(StatusRecord::ServerShutdown);
+            }
         }
     }
 
@@ -291,11 +310,14 @@ impl StatusMap {
         // wz.set_value(new_status);
         // Ok(())
 
-        let mut user_map = self.0.user_status.write().unwrap();
-        let mut zipper = user_map.write_zipper_at_path(path);
-        zipper.set_val(new_status);
+        //Write the new status into the user_map map
+        {
+            let mut user_map = self.0.user_status.write().unwrap();
+            let mut zipper = user_map.write_zipper_at_path(path);
+            zipper.set_val(new_status);
+        }
 
-        //Send the status to any streams monitoring this path
+        //Send the updated status to any streams monitoring this path
         self.send_new_status(path);
 
         Ok(())
